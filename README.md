@@ -94,8 +94,8 @@ After deploying, you can set these in Railway's **Variables** tab:
 
 | Variable | Value | Effect |
 |---|---|---|
-| `SHOW_REASONING` | `true` | Shows model reasoning in `<thinking>` tags |
-| `ENABLE_THINKING_MODE` | `true` | Sends thinking parameters to supported models |
+| `SHOW_REASONING` | `false` | Shows model reasoning in `<thinking>` tags |
+| `ENABLE_THINKING_MODE` | `false` | Sends thinking parameters to supported models |
 | `DISCORD_WEBHOOK_URL` | Webhook URL | Alerts you when models fail validation |
 | `SKIP_VALIDATION` | `true` | Disables startup model checks |
 
