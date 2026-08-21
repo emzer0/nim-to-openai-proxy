@@ -22,13 +22,21 @@ app.use(
 // AUTH
 // ============================================================
 function authenticate(req, res, next) {
+  // Public endpoints
   if (
     req.path === "/" ||
-    req.path === "/health" ||
-    req.path === "/v1/models"
+    req.path === "/health"
   ) {
     return next();
   }
+  // /v1/models is also public unless CLIENT_AUTH_KEY is set
+  if (
+    req.path === "/v1/models" &&
+    !CLIENT_AUTH_KEY
+  ) {
+    return next();
+  }
+  // No client key configured = no proxy auth
   if (!CLIENT_AUTH_KEY) {
     return next();
   }
@@ -43,7 +51,8 @@ function authenticate(req, res, next) {
       }
     });
   }
-  const token = authorization.substring(7);
+  const token =
+    authorization.slice(7);
   if (token !== CLIENT_AUTH_KEY) {
     return res.status(401).json({
       error: {
@@ -62,7 +71,7 @@ app.use(authenticate);
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
-    service: "Puter Kimi K2.6 OpenAI-compatible proxy",
+    service: "Puter OpenAI-compatible proxy",
     provider: "puter",
     model: DEFAULT_MODEL
   });
@@ -79,70 +88,49 @@ app.get("/health", (req, res) => {
     max_output_tokens: 262144,
     streaming: true,
     openai_compatible: true,
-    version: "8.0.0"
+    version: "9.0.0"
   });
 });
 // ============================================================
 // MODELS
+//
+// IMPORTANT:
+// We do NOT call Puter /models anymore.
+// We expose the models we know Puter supports directly.
+// This avoids the previous 404 problem.
 // ============================================================
-app.get("/v1/models", async (req, res) => {
-  try {
-    const response = await fetch(
-      `${PUTER_BASE_URL}/models`,
+app.get("/v1/models", (req, res) => {
+  const now =
+    Math.floor(Date.now() / 1000);
+  return res.json({
+    object: "list",
+    data: [
       {
-        method: "GET",
-        headers: {
-          Authorization:
-            `Bearer ${PUTER_AUTH_TOKEN}`,
-          Accept: "application/json"
-        }
+        id: "moonshotai/kimi-k2.6",
+        object: "model",
+        created: now,
+        owned_by: "puter"
+      },
+      {
+        id: "moonshotai/kimi-k3",
+        object: "model",
+        created: now,
+        owned_by: "puter"
+      },
+      {
+        id: "z-ai/glm-5.2",
+        object: "model",
+        created: now,
+        owned_by: "puter"
+      },
+      {
+        id: "openai/gpt-5.5",
+        object: "model",
+        created: now,
+        owned_by: "puter"
       }
-    );
-    const text = await response.text();
-    console.log(
-      `[PUTER MODELS] HTTP ${response.status}`
-    );
-    if (!response.ok) {
-      console.error(text);
-      return res.status(response.status).json({
-        error: {
-          message:
-            `Puter returned HTTP ${response.status}`,
-          type: "upstream_error",
-          code: response.status,
-          upstream: "puter"
-        }
-      });
-    }
-    let data;
-    try {
-      data = JSON.parse(text);
-    } catch {
-      return res.status(502).json({
-        error: {
-          message:
-            "Puter returned invalid JSON",
-          type: "upstream_error",
-          code: 502,
-          upstream: "puter"
-        }
-      });
-    }
-    return res.json(data);
-  } catch (error) {
-    console.error(
-      "[MODELS ERROR]",
-      error
-    );
-    return res.status(500).json({
-      error: {
-        message: error.message,
-        type: "proxy_error",
-        code: 500,
-        upstream: "puter"
-      }
-    });
-  }
+    ]
+  });
 });
 // ============================================================
 // CHAT COMPLETIONS
@@ -167,38 +155,42 @@ app.post(
         });
       }
       // --------------------------------------------------------
-      // IMPORTANT:
-      // Always use Kimi K2.6.
+      // MODEL
+      // --------------------------------------------------------
+      const requestedModel =
+        body.model || DEFAULT_MODEL;
+      // --------------------------------------------------------
+      // BUILD CLEAN OPENAI REQUEST
       // --------------------------------------------------------
       const requestBody = {
         ...body,
-        model: DEFAULT_MODEL
+        model: requestedModel
       };
-      // Remove proxy/provider-specific fields.
+      // Fields that Janitor/proxies may send
+      // but Puter may not need.
       delete requestBody.provider;
+      // Don't send proxy-specific fields upstream.
+      delete requestBody.api_key;
+      delete requestBody.proxy;
+      delete requestBody.proxy_url;
+      // --------------------------------------------------------
+      // STREAM
+      // --------------------------------------------------------
       if (
         requestBody.stream !== undefined
       ) {
         requestBody.stream =
           Boolean(requestBody.stream);
       }
+      const isStreaming =
+        Boolean(requestBody.stream);
       console.log(
-        "================================================"
-      );
-      console.log(
-        `[REQUEST] model=${requestBody.model}`
-      );
-      console.log(
-        `[REQUEST] stream=${Boolean(requestBody.stream)}`
-      );
-      console.log(
-        `[REQUEST] messages=${requestBody.messages.length}`
-      );
-      console.log(
-        "================================================"
+        `[REQUEST] model=${requestedModel} ` +
+        `stream=${isStreaming} ` +
+        `messages=${body.messages.length}`
       );
       // ========================================================
-      // SEND DIRECTLY TO PUTER OPENAI API
+      // UPSTREAM REQUEST
       // ========================================================
       const upstream =
         await fetch(
@@ -206,12 +198,12 @@ app.post(
           {
             method: "POST",
             headers: {
-              Authorization:
+              "Authorization":
                 `Bearer ${PUTER_AUTH_TOKEN}`,
               "Content-Type":
                 "application/json",
-              Accept:
-                requestBody.stream
+              "Accept":
+                isStreaming
                   ? "text/event-stream"
                   : "application/json"
             },
@@ -220,12 +212,12 @@ app.post(
           }
         );
       console.log(
-        `[PUTER] HTTP ${upstream.status}`
+        `[UPSTREAM] HTTP ${upstream.status}`
       );
       // ========================================================
       // STREAMING
       // ========================================================
-      if (requestBody.stream) {
+      if (isStreaming) {
         res.status(
           upstream.status
         );
@@ -236,7 +228,7 @@ app.post(
         res.setHeader(
           "Content-Type",
           contentType ||
-          "text/event-stream"
+            "text/event-stream; charset=utf-8"
         );
         res.setHeader(
           "Cache-Control",
@@ -250,6 +242,7 @@ app.post(
           "X-Accel-Buffering",
           "no"
         );
+        res.flushHeaders();
         if (!upstream.body) {
           return res.end();
         }
@@ -257,27 +250,30 @@ app.post(
           upstream.body.getReader();
         try {
           while (true) {
-            const {
-              done,
-              value
-            } =
+            const result =
               await reader.read();
-            if (done) {
+            if (result.done) {
               break;
             }
-            if (!res.writableEnded) {
+            if (
+              !res.writableEnded
+            ) {
               res.write(
-                Buffer.from(value)
+                Buffer.from(
+                  result.value
+                )
               );
             }
           }
-        } catch (streamError) {
+        } catch (error) {
           console.error(
             "[STREAM ERROR]",
-            streamError.message
+            error.message
           );
         } finally {
-          if (!res.writableEnded) {
+          if (
+            !res.writableEnded
+          ) {
             res.end();
           }
         }
@@ -288,53 +284,70 @@ app.post(
       // ========================================================
       const text =
         await upstream.text();
-      if (!upstream.ok) {
-        console.error(
-          `[PUTER ERROR] HTTP ${upstream.status}`
+      if (!text) {
+        return res.status(
+          upstream.ok
+            ? 200
+            : upstream.status
+        ).json(
+          upstream.ok
+            ? {}
+            : {
+                error: {
+                  message:
+                    `Puter returned HTTP ${upstream.status}`,
+                  type:
+                    "upstream_error",
+                  code:
+                    upstream.status,
+                  upstream:
+                    "puter"
+                }
+              }
         );
-        console.error(text);
-        let upstreamData = null;
-        try {
-          upstreamData =
-            JSON.parse(text);
-        } catch {}
-        return res
-          .status(upstream.status)
-          .json({
-            error: {
-              message:
-                upstreamData?.error?.message ||
-                text ||
-                `Puter returned HTTP ${upstream.status}`,
-              type:
-                upstreamData?.error?.type ||
-                "upstream_error",
-              code:
-                upstream.status,
-              upstream:
-                "puter",
-              model:
-                DEFAULT_MODEL
-            }
-          });
       }
       let data;
       try {
         data =
           JSON.parse(text);
       } catch {
-        return res.status(502).json({
+        data = {
           error: {
             message:
-              "Puter returned invalid JSON",
+              text,
             type:
               "upstream_error",
             code:
-              502,
+              upstream.status,
             upstream:
               "puter"
           }
-        });
+        };
+      }
+      if (!upstream.ok) {
+        console.error(
+          `[PUTER ERROR] HTTP ${upstream.status}`
+        );
+        console.error(
+          text
+        );
+        return res
+          .status(upstream.status)
+          .json({
+            error: {
+              message:
+                data?.error?.message ||
+                text ||
+                `Puter returned HTTP ${upstream.status}`,
+              type:
+                data?.error?.type ||
+                "upstream_error",
+              code:
+                upstream.status,
+              upstream:
+                "puter"
+            }
+          });
       }
       return res.json(data);
     } catch (error) {
@@ -345,15 +358,14 @@ app.post(
       return res.status(500).json({
         error: {
           message:
-            error.message,
+            error.message ||
+            "Internal proxy error",
           type:
             "proxy_error",
           code:
             500,
           upstream:
-            "puter",
-          model:
-            DEFAULT_MODEL
+            "puter"
         }
       });
     }
@@ -387,16 +399,16 @@ app.listen(
       "================================================"
     );
     console.log(
-      "[PROXY] Puter Kimi K2.6 proxy is running"
+      "[PROXY] Puter → OpenAI-compatible proxy"
     );
     console.log(
       `[PROXY] Port: ${PORT}`
     );
     console.log(
-      `[PROXY] Model: ${DEFAULT_MODEL}`
+      "[PROXY] Provider: Puter"
     );
     console.log(
-      "[PROXY] Context: 262144"
+      `[PROXY] Default model: ${DEFAULT_MODEL}`
     );
     console.log(
       "[PROXY] Streaming: ENABLED"
