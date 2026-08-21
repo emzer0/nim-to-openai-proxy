@@ -1,7 +1,8 @@
 // server.js — Kimi K2.6 OpenAI-compatible proxy
 // NVIDIA NIM + Render
-// Thinking ON
-// Streaming supported
+// 256K context / 65,536 max output
+// Thinking + Streaming
+// OpenAI-compatible
 
 const express = require('express');
 const cors = require('cors');
@@ -12,9 +13,9 @@ const { timingSafeEqual } = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 // CONFIG
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 
 const NIM_API_BASE =
   process.env.NIM_API_BASE ||
@@ -23,8 +24,6 @@ const NIM_API_BASE =
 const NIM_API_KEY = process.env.NIM_API_KEY;
 const CLIENT_AUTH_KEY = process.env.CLIENT_AUTH_KEY;
 
-// Thinking is intentionally controlled by Render Environment Variables.
-// Set ENABLE_THINKING_MODE=true
 const ENABLE_THINKING_MODE =
   process.env.ENABLE_THINKING_MODE === 'true';
 
@@ -37,8 +36,9 @@ const SKIP_VALIDATION =
 const DISCORD_WEBHOOK_URL =
   process.env.DISCORD_WEBHOOK_URL;
 
-// NVIDIA Kimi K2.6 API limit.
-// IMPORTANT: this is OUTPUT max_tokens, not context length.
+// Kimi K2.6:
+// Context: 256K
+// Maximum generated output: 65,536
 const MAX_TOKENS_LIMIT = 65536;
 
 const REQUEST_TIMEOUT_MS = 180000;
@@ -47,62 +47,69 @@ const MAX_BUFFER_SIZE = 1024 * 1024;
 
 const KIMI_MODEL = 'moonshotai/kimi-k2.6';
 
-if (ENABLE_THINKING_MODE) {
-  console.log('[CONFIG] Thinking mode: ENABLED');
-} else {
-  console.log('[CONFIG] Thinking mode: DISABLED');
-}
+console.log(
+  `[CONFIG] Model: ${KIMI_MODEL}`
+);
 
-if (SHOW_REASONING) {
-  console.log('[CONFIG] Reasoning display: ENABLED');
-}
+console.log(
+  `[CONFIG] Thinking: ${
+    ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'
+  }`
+);
 
-// ─────────────────────────────────────────────────────────────
-// VALIDATE CONFIG
-// ─────────────────────────────────────────────────────────────
+console.log(
+  `[CONFIG] Show reasoning: ${
+    SHOW_REASONING ? 'ENABLED' : 'DISABLED'
+  }`
+);
+
+// ============================================================
+// CONFIG VALIDATION
+// ============================================================
 
 function validateConfig() {
-  const fatal = (msg) => {
-    console.error(`[FATAL] ${msg}`);
+  const fatal = (message) => {
+    console.error(`[FATAL] ${message}`);
     process.exit(1);
   };
 
   if (!NIM_API_KEY) {
     fatal(
-      'NIM_API_KEY is required. Get one at https://build.nvidia.com/'
+      'NIM_API_KEY is missing.'
     );
   }
 
   if (!CLIENT_AUTH_KEY) {
     console.warn(
-      '[WARN] CLIENT_AUTH_KEY not set. Protected requests will return 403.'
+      '[WARN] CLIENT_AUTH_KEY is not set.'
     );
   }
 }
 
 validateConfig();
 
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 // MODEL MAPPING
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 
-// Everything intentionally points to Kimi K2.6.
-// This prevents the proxy from silently switching models.
+// Janitor can request whatever model name it wants.
+// The proxy ALWAYS sends Kimi K2.6 upstream.
 
 const MODEL_MAPPING = {
   'kimi-k2.6': KIMI_MODEL,
-  'gpt-4-turbo': KIMI_MODEL
+
+  // Common OpenAI-compatible aliases
+  'gpt-4-turbo': KIMI_MODEL,
+  'gpt-4': KIMI_MODEL,
+  'gpt-4o': KIMI_MODEL,
+  'gpt-3.5-turbo': KIMI_MODEL,
+  'claude-3-opus': KIMI_MODEL,
+  'claude-3-sonnet': KIMI_MODEL
 };
 
-// No fallback models.
-// If Kimi fails, we want the actual Kimi error instead of
-// silently switching to another model.
-
-const FALLBACK_MODELS = [];
-
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 // MIDDLEWARE
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 
 app.use(cors());
 
@@ -112,22 +119,25 @@ app.use(
   })
 );
 
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 // AUTH
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 
 function extractBearerToken(authHeader) {
-  if (!authHeader || typeof authHeader !== 'string') {
+  if (
+    !authHeader ||
+    typeof authHeader !== 'string'
+  ) {
     return null;
   }
 
-  const parts = authHeader.trim().split(/\s+/);
+  const parts =
+    authHeader.trim().split(/\s+/);
 
-  if (parts.length !== 2) {
-    return null;
-  }
-
-  if (parts[0] !== 'Bearer') {
+  if (
+    parts.length !== 2 ||
+    parts[0] !== 'Bearer'
+  ) {
     return null;
   }
 
@@ -135,7 +145,11 @@ function extractBearerToken(authHeader) {
 }
 
 function safeTimingEqual(a, b) {
-  if (!a || !b || a.length !== b.length) {
+  if (
+    !a ||
+    !b ||
+    a.length !== b.length
+  ) {
     return false;
   }
 
@@ -150,6 +164,7 @@ function safeTimingEqual(a, b) {
 }
 
 app.use((req, res, next) => {
+
   // Public endpoints
   if (
     req.path === '/health' ||
@@ -158,25 +173,38 @@ app.use((req, res, next) => {
     return next();
   }
 
-  const token = extractBearerToken(
-    req.headers.authorization
-  );
+  const token =
+    extractBearerToken(
+      req.headers.authorization
+    );
 
-  if (!token || !CLIENT_AUTH_KEY) {
+  if (
+    !token ||
+    !CLIENT_AUTH_KEY
+  ) {
     return res.status(403).json({
       error: {
-        message: 'Forbidden: Invalid or missing authentication',
-        type: 'authentication_error',
+        message:
+          'Forbidden: Invalid or missing authentication',
+        type:
+          'authentication_error',
         code: 403
       }
     });
   }
 
-  if (!safeTimingEqual(token, CLIENT_AUTH_KEY)) {
+  if (
+    !safeTimingEqual(
+      token,
+      CLIENT_AUTH_KEY
+    )
+  ) {
     return res.status(403).json({
       error: {
-        message: 'Forbidden: Invalid authentication credentials',
-        type: 'authentication_error',
+        message:
+          'Forbidden: Invalid authentication credentials',
+        type:
+          'authentication_error',
         code: 403
       }
     });
@@ -185,71 +213,87 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─────────────────────────────────────────────────────────────
-// MODEL VALIDATION
-// ─────────────────────────────────────────────────────────────
+// ============================================================
+// NVIDIA MODEL VALIDATION
+// ============================================================
 
 async function validateModels() {
+
   if (SKIP_VALIDATION) {
     console.log(
-      '[VALIDATION] Skipped (SKIP_VALIDATION=true)'
+      '[VALIDATION] Skipped.'
     );
     return;
   }
 
   console.log(
-    '[VALIDATION] Checking Kimi K2.6 availability via /v1/models...'
+    '[VALIDATION] Checking Kimi K2.6...'
   );
 
   try {
-    const response = await axios.get(
-      `${NIM_API_BASE}/models`,
-      {
-        headers: {
-          Authorization: `Bearer ${NIM_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: VALIDATION_TIMEOUT_MS
-      }
-    );
 
-    const availableModels = new Set(
-      (response.data.data || []).map(
-        (model) => model.id
-      )
-    );
+    const response =
+      await axios.get(
+        `${NIM_API_BASE}/models`,
+        {
+          headers: {
+            Authorization:
+              `Bearer ${NIM_API_KEY}`,
+            Accept:
+              'application/json'
+          },
 
-    if (availableModels.has(KIMI_MODEL)) {
-      console.log(
-        `[VALIDATION] ✓ kimi-k2.6 → ${KIMI_MODEL}`
+          timeout:
+            VALIDATION_TIMEOUT_MS
+        }
       );
 
-      console.log(
-        `[VALIDATION] ✓ gpt-4-turbo → ${KIMI_MODEL}`
+    const models =
+      response.data?.data || [];
+
+    const found =
+      models.some(
+        model =>
+          model.id === KIMI_MODEL
       );
+
+    if (found) {
+
+      console.log(
+        `[VALIDATION] ✓ ${KIMI_MODEL}`
+      );
+
     } else {
+
       console.warn(
-        `[VALIDATION] ✗ ${KIMI_MODEL} not found in NIM catalog`
+        `[VALIDATION] Kimi was not returned by /models.`
+      );
+
+      console.warn(
+        `[VALIDATION] This does NOT automatically mean inference is unavailable.`
       );
     }
 
-  } catch (err) {
+  } catch (error) {
+
     console.warn(
-      `[VALIDATION] /v1/models failed: ${err.message}`
+      `[VALIDATION] /models check failed: ${error.message}`
     );
 
     console.warn(
-      '[VALIDATION] Continuing anyway because the inference endpoint is the real test.'
+      '[VALIDATION] Continuing — inference endpoint is the actual test.'
     );
   }
 }
 
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 // SAFE STREAM WRITE
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 
 function safeWrite(res, data) {
+
   try {
+
     if (
       !res.writableEnded &&
       !res.destroyed &&
@@ -258,88 +302,149 @@ function safeWrite(res, data) {
       res.write(data);
       return true;
     }
-  } catch (err) {
+
+  } catch (error) {
+
     console.warn(
       '[STREAM] Write failed:',
-      err.message
+      error.message
     );
   }
 
   return false;
 }
 
-// ─────────────────────────────────────────────────────────────
-// KIMI REQUEST
-// ─────────────────────────────────────────────────────────────
+// ============================================================
+// NVIDIA KIMI REQUEST
+// ============================================================
 
-async function callKimi(baseRequest) {
+async function callKimi(requestBody) {
+
   return axios.post(
+
     `${NIM_API_BASE}/chat/completions`,
-    {
-      ...baseRequest,
-      model: KIMI_MODEL
-    },
+
+    requestBody,
+
     {
       headers: {
-        Authorization: `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json',
-        Accept: baseRequest.stream
-          ? 'text/event-stream'
-          : 'application/json'
+        Authorization:
+          `Bearer ${NIM_API_KEY}`,
+
+        'Content-Type':
+          'application/json',
+
+        Accept:
+          requestBody.stream
+            ? 'text/event-stream'
+            : 'application/json'
       },
 
-      responseType: baseRequest.stream
-        ? 'stream'
-        : 'json',
+      responseType:
+        requestBody.stream
+          ? 'stream'
+          : 'json',
 
-      timeout: REQUEST_TIMEOUT_MS
+      timeout:
+        REQUEST_TIMEOUT_MS,
+
+      // Important:
+      // allow us to inspect NVIDIA's actual response
+      validateStatus:
+        status => status >= 200 && status < 300
     }
   );
 }
 
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 // HEALTH
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    model: KIMI_MODEL,
-    thinking: ENABLE_THINKING_MODE,
-    max_output_tokens: MAX_TOKENS_LIMIT,
-    version: '3.0.0'
-  });
-});
+app.get(
+  '/health',
+  (req, res) => {
 
-// ─────────────────────────────────────────────────────────────
+    res.json({
+      status: 'ok',
+
+      model:
+        KIMI_MODEL,
+
+      thinking:
+        ENABLE_THINKING_MODE,
+
+      context_window:
+        262144,
+
+      max_output_tokens:
+        MAX_TOKENS_LIMIT,
+
+      version:
+        '4.0.0'
+    });
+  }
+);
+
+// ============================================================
 // MODELS
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 
-app.get('/v1/models', (req, res) => {
-  res.json({
-    object: 'list',
+app.get(
+  '/v1/models',
+  (req, res) => {
 
-    data: [
-      {
-        id: 'kimi-k2.6',
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'moonshotai'
-      },
+    const now =
+      Math.floor(
+        Date.now() / 1000
+      );
 
-      {
-        id: 'gpt-4-turbo',
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'nim-proxy'
-      }
-    ]
-  });
-});
+    res.json({
+      object: 'list',
 
-// ─────────────────────────────────────────────────────────────
+      data: [
+        {
+          id: 'kimi-k2.6',
+          object: 'model',
+          created: now,
+          owned_by: 'moonshotai'
+        },
+
+        // Janitor/OpenAI compatibility
+        {
+          id: 'gpt-4-turbo',
+          object: 'model',
+          created: now,
+          owned_by: 'nim-proxy'
+        },
+
+        {
+          id: 'gpt-4',
+          object: 'model',
+          created: now,
+          owned_by: 'nim-proxy'
+        },
+
+        {
+          id: 'gpt-4o',
+          object: 'model',
+          created: now,
+          owned_by: 'nim-proxy'
+        },
+
+        {
+          id: 'gpt-3.5-turbo',
+          object: 'model',
+          created: now,
+          owned_by: 'nim-proxy'
+        }
+      ]
+    });
+  }
+);
+
+// ============================================================
 // CHAT COMPLETIONS
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 
 app.post(
   '/v1/chat/completions',
@@ -351,6 +456,7 @@ app.post(
     try {
 
       const {
+        model,
         messages,
         temperature,
         max_tokens,
@@ -359,134 +465,263 @@ app.post(
         tools,
         tool_choice,
         seed,
-        stream_options
+        stream_options,
+        stop
       } = req.body;
+
+      // --------------------------------------------------------
+      // Validate messages
+      // --------------------------------------------------------
 
       if (
         !Array.isArray(messages) ||
         messages.length === 0
       ) {
+
         return res.status(400).json({
           error: {
-            message: 'messages must be a non-empty array',
-            type: 'invalid_request_error',
+            message:
+              'messages must be a non-empty array',
+
+            type:
+              'invalid_request_error',
+
             code: 400
           }
         });
       }
 
-      // Kimi API supports temperature 0–1.
-      const safeTemperature =
-        temperature === undefined
-          ? 0.7
-          : Math.max(
-              0,
-              Math.min(
-                Number(temperature),
-                1
-              )
-            );
+      // --------------------------------------------------------
+      // Temperature
+      // Kimi K2.6 supports 0–1
+      // --------------------------------------------------------
 
-      // IMPORTANT:
-      // 65536 is the maximum OUTPUT token value accepted
-      // by Kimi K2.6.
-      const requestedMaxTokens =
-        max_tokens === undefined
-          ? 8192
-          : Number(max_tokens);
+      let safeTemperature = 0.7;
 
-      const safeMaxTokens = Math.max(
-        1,
-        Math.min(
-          requestedMaxTokens,
-          MAX_TOKENS_LIMIT
+      if (
+        temperature !== undefined &&
+        Number.isFinite(
+          Number(temperature)
         )
-      );
+      ) {
 
-      // ───────────────────────────────────────────────
-      // BASE REQUEST
-      // ───────────────────────────────────────────────
+        safeTemperature =
+          Math.max(
+            0,
+            Math.min(
+              Number(temperature),
+              1
+            )
+          );
+      }
+
+      // --------------------------------------------------------
+      // max_tokens
+      // Maximum = 65,536
+      // --------------------------------------------------------
+
+      let requestedMaxTokens =
+        8192;
+
+      if (
+        max_tokens !== undefined &&
+        Number.isFinite(
+          Number(max_tokens)
+        )
+      ) {
+
+        requestedMaxTokens =
+          Number(max_tokens);
+      }
+
+      const safeMaxTokens =
+        Math.max(
+          1,
+          Math.min(
+            requestedMaxTokens,
+            MAX_TOKENS_LIMIT
+          )
+        );
+
+      // --------------------------------------------------------
+      // STREAM
+      // --------------------------------------------------------
+
+      const useStream =
+        Boolean(stream);
+
+      // --------------------------------------------------------
+      // Build NVIDIA request
+      // --------------------------------------------------------
 
       const baseRequest = {
+
+        model:
+          KIMI_MODEL,
+
         messages,
 
-        temperature: safeTemperature,
+        temperature:
+          safeTemperature,
 
-        max_tokens: safeMaxTokens,
+        max_tokens:
+          safeMaxTokens,
 
-        stream: Boolean(stream)
+        stream:
+          useStream
       };
 
-      // Preserve optional OpenAI-compatible parameters.
+      // --------------------------------------------------------
+      // Optional parameters
+      // --------------------------------------------------------
 
-      if (top_p !== undefined) {
-        baseRequest.top_p = top_p;
+      if (
+        top_p !== undefined
+      ) {
+        baseRequest.top_p =
+          top_p;
       }
 
-      if (tools !== undefined) {
-        baseRequest.tools = tools;
+      if (
+        tools !== undefined
+      ) {
+        baseRequest.tools =
+          tools;
       }
 
-      if (tool_choice !== undefined) {
-        baseRequest.tool_choice = tool_choice;
+      if (
+        tool_choice !== undefined
+      ) {
+        baseRequest.tool_choice =
+          tool_choice;
       }
 
-      if (seed !== undefined) {
-        baseRequest.seed = seed;
+      if (
+        seed !== undefined
+      ) {
+        baseRequest.seed =
+          seed;
       }
 
-      if (stream_options !== undefined) {
+      if (
+        stream_options !== undefined
+      ) {
         baseRequest.stream_options =
           stream_options;
       }
 
-      // ───────────────────────────────────────────────
-      // THINKING
-      // ───────────────────────────────────────────────
-
-      if (ENABLE_THINKING_MODE) {
-
-        baseRequest.chat_template_kwargs = {
-          thinking: true
-        };
-
-        console.log(
-          '[KIMI] Thinking: ON'
-        );
-
-      } else {
-
-        baseRequest.chat_template_kwargs = {
-          thinking: false
-        };
-
-        console.log(
-          '[KIMI] Thinking: OFF'
-        );
+      if (
+        stop !== undefined
+      ) {
+        baseRequest.stop =
+          stop;
       }
 
+      // --------------------------------------------------------
+      // THINKING
+      //
+      // NVIDIA K2.6 officially supports:
+      // chat_template_kwargs: { thinking: true/false }
+      // --------------------------------------------------------
+
+      baseRequest.chat_template_kwargs = {
+        thinking:
+          ENABLE_THINKING_MODE
+      };
+
       console.log(
-        `[KIMI] Request | max_tokens=${safeMaxTokens} | stream=${Boolean(stream)}`
+        `[KIMI] model=${KIMI_MODEL} ` +
+        `temperature=${safeTemperature} ` +
+        `max_tokens=${safeMaxTokens} ` +
+        `stream=${useStream} ` +
+        `thinking=${ENABLE_THINKING_MODE}`
       );
 
-      // ───────────────────────────────────────────────
+      // --------------------------------------------------------
       // CALL NVIDIA
-      // ───────────────────────────────────────────────
+      // --------------------------------------------------------
 
-      const response =
-        await callKimi(baseRequest);
+      let response;
 
-      upstreamStream = response.data;
+      try {
+
+        response =
+          await callKimi(
+            baseRequest
+          );
+
+      } catch (error) {
+
+        // ======================================================
+        // VERY IMPORTANT:
+        // Print the REAL NVIDIA error.
+        // ======================================================
+
+        console.error(
+          '================================================'
+        );
+
+        console.error(
+          '[NVIDIA ERROR]'
+        );
+
+        console.error(
+          'Status:',
+          error.response?.status
+        );
+
+        console.error(
+          'Status text:',
+          error.response?.statusText
+        );
+
+        console.error(
+          'Headers:',
+          JSON.stringify(
+            error.response?.headers || {},
+            null,
+            2
+          )
+        );
+
+        console.error(
+          'Data:',
+          JSON.stringify(
+            error.response?.data || {},
+            null,
+            2
+          )
+        );
+
+        console.error(
+          'Request URL:',
+          `${NIM_API_BASE}/chat/completions`
+        );
+
+        console.error(
+          'Model:',
+          KIMI_MODEL
+        );
+
+        console.error(
+          '================================================'
+        );
+
+        throw error;
+      }
+
+      upstreamStream =
+        response.data;
 
       console.log(
-        `[KIMI] NVIDIA response received`
+        '[KIMI] NVIDIA response received.'
       );
 
-      // ───────────────────────────────────────────────
+      // ========================================================
       // STREAMING
-      // ───────────────────────────────────────────────
+      // ========================================================
 
-      if (stream) {
+      if (useStream) {
 
         res.statusCode = 200;
 
@@ -514,9 +749,15 @@ app.post(
           new StringDecoder('utf8');
 
         let buffer = '';
-        let reasoningOpen = false;
-        let doneSent = false;
-        let cleanedUp = false;
+
+        let reasoningOpen =
+          false;
+
+        let doneSent =
+          false;
+
+        let cleanedUp =
+          false;
 
         const cleanup = () => {
 
@@ -530,7 +771,9 @@ app.post(
             upstreamStream.removeAllListeners();
           }
 
-          req.removeAllListeners('close');
+          req.removeAllListeners(
+            'close'
+          );
         };
 
         const sendDone = () => {
@@ -546,112 +789,127 @@ app.post(
           }
         };
 
-        const processLine = (line) => {
+        const processLine =
+          (line) => {
 
-          if (!line.startsWith('data: ')) {
-            return;
-          }
+            if (
+              !line.startsWith(
+                'data: '
+              )
+            ) {
+              return;
+            }
 
-          const payload =
-            line.slice(6).trim();
+            const payload =
+              line
+                .slice(6)
+                .trim();
 
-          if (payload === '[DONE]') {
+            if (
+              payload ===
+              '[DONE]'
+            ) {
 
-            sendDone();
+              sendDone();
 
-            streamEndedCleanly = true;
+              streamEndedCleanly =
+                true;
 
-            return;
-          }
+              return;
+            }
 
-          try {
+            try {
 
-            const data =
-              JSON.parse(payload);
+              const data =
+                JSON.parse(
+                  payload
+                );
 
-            const choice =
-              data.choices?.[0];
+              const delta =
+                data
+                  .choices?.[0]
+                  ?.delta;
 
-            const delta =
-              choice?.delta;
+              if (delta) {
 
-            if (delta) {
+                const reasoning =
+                  delta.reasoning_content;
 
-              const reasoning =
-                delta.reasoning_content;
+                const content =
+                  delta.content;
 
-              const normalContent =
-                delta.content;
-
-              // ───────────────────────────────
-              // Optional reasoning display
-              // ───────────────────────────────
-
-              if (SHOW_REASONING) {
+                // ------------------------------------------------
+                // SHOW_REASONING=true
+                // ------------------------------------------------
 
                 if (
-                  reasoning &&
-                  !reasoningOpen
+                  SHOW_REASONING
                 ) {
 
-                  delta.content =
-                    `<thinking>\n${reasoning}`;
+                  if (
+                    reasoning &&
+                    !reasoningOpen
+                  ) {
 
-                  reasoningOpen = true;
+                    delta.content =
+                      `<thinking>\n${reasoning}`;
 
-                } else if (
-                  reasoning
-                ) {
+                    reasoningOpen =
+                      true;
 
-                  delta.content =
-                    reasoning;
+                  } else if (
+                    reasoning
+                  ) {
 
-                } else if (
-                  normalContent &&
-                  reasoningOpen
-                ) {
+                    delta.content =
+                      reasoning;
 
-                  delta.content =
-                    `\n</thinking>\n\n${normalContent}`;
+                  } else if (
+                    content &&
+                    reasoningOpen
+                  ) {
 
-                  reasoningOpen = false;
+                    delta.content =
+                      `\n</thinking>\n\n${content}`;
+
+                    reasoningOpen =
+                      false;
+
+                  } else {
+
+                    delta.content =
+                      content || '';
+                  }
 
                 } else {
 
-                  delta.content =
-                    normalContent || '';
+                  // Never expose hidden reasoning
+                  delete delta.reasoning_content;
                 }
-
               }
 
-              // Don't leak reasoning_content
-              // unless SHOW_REASONING is enabled.
+              safeWrite(
+                res,
+                `data: ${JSON.stringify(data)}\n\n`
+              );
 
-              if (!SHOW_REASONING) {
-                delete delta.reasoning_content;
-              }
+            } catch (error) {
+
+              console.warn(
+                '[STREAM] Invalid JSON chunk:',
+                error.message
+              );
             }
-
-            safeWrite(
-              res,
-              `data: ${JSON.stringify(data)}\n\n`
-            );
-
-          } catch (err) {
-
-            console.warn(
-              '[STREAM] Invalid JSON chunk:',
-              err.message
-            );
-          }
-        };
+          };
 
         upstreamStream.on(
           'data',
-          (chunk) => {
+          chunk => {
 
             buffer +=
-              decoder.write(chunk);
+              decoder.write(
+                chunk
+              );
 
             if (
               buffer.length >
@@ -659,7 +917,7 @@ app.post(
             ) {
 
               console.error(
-                '[STREAM] Buffer overflow'
+                '[STREAM] Buffer overflow.'
               );
 
               safeWrite(
@@ -668,6 +926,7 @@ app.post(
                   error: {
                     message:
                       'Stream buffer overflow',
+
                     type:
                       'stream_error'
                   }
@@ -698,7 +957,10 @@ app.post(
             for (
               const line of lines
             ) {
-              processLine(line);
+
+              processLine(
+                line
+              );
             }
           }
         );
@@ -710,13 +972,18 @@ app.post(
             buffer +=
               decoder.end();
 
-            if (buffer.trim()) {
+            if (
+              buffer.trim()
+            ) {
 
               for (
                 const line
                 of buffer.split('\n')
               ) {
-                processLine(line);
+
+                processLine(
+                  line
+                );
               }
             }
 
@@ -737,11 +1004,11 @@ app.post(
 
         upstreamStream.on(
           'error',
-          (err) => {
+          error => {
 
             console.error(
-              '[STREAM] NVIDIA error:',
-              err.message
+              '[STREAM] NVIDIA stream error:',
+              error.message
             );
 
             if (
@@ -754,6 +1021,7 @@ app.post(
                   error: {
                     message:
                       'NVIDIA Kimi stream interrupted',
+
                     type:
                       'stream_error'
                   }
@@ -783,7 +1051,7 @@ app.post(
             ) {
 
               console.warn(
-                '[STREAM] Client disconnected'
+                '[STREAM] Client disconnected.'
               );
             }
 
@@ -803,9 +1071,9 @@ app.post(
         return;
       }
 
-      // ───────────────────────────────────────────────
+      // ========================================================
       // NON-STREAMING
-      // ───────────────────────────────────────────────
+      // ========================================================
 
       const data =
         response.data;
@@ -827,13 +1095,18 @@ app.post(
               ) {
 
                 content =
-                  `<thinking>\n${message.reasoning_content}\n</thinking>\n\n${content}`;
+                  `<thinking>\n` +
+                  `${message.reasoning_content}` +
+                  `\n</thinking>\n\n` +
+                  content;
               }
 
               return {
+
                 index,
 
                 message: {
+
                   role:
                     message.role ||
                     'assistant',
@@ -852,6 +1125,7 @@ app.post(
           );
 
       res.json({
+
         id:
           data.id ||
           `chatcmpl-${Date.now()}`,
@@ -866,6 +1140,7 @@ app.post(
           ),
 
         model:
+          model ||
           'kimi-k2.6',
 
         choices,
@@ -880,54 +1155,78 @@ app.post(
 
     } catch (error) {
 
+      // ========================================================
+      // FINAL ERROR HANDLER
+      // ========================================================
+
       console.error(
         '[PROXY] Request failed:',
         error.message
       );
 
-      if (error.response) {
+      const status =
+        error.response?.status ||
+        500;
 
-        console.error(
-          '[PROXY] NVIDIA status:',
-          error.response.status
-        );
+      let upstreamData =
+        error.response?.data;
 
-        console.error(
-          '[PROXY] NVIDIA data:',
-          error.response.data
-        );
+      // Axios may give us a stream for streamed errors.
+      // Try to extract it if necessary.
+      if (
+        upstreamData &&
+        typeof upstreamData !== 'object'
+      ) {
+        try {
+          upstreamData =
+            JSON.parse(
+              String(upstreamData)
+            );
+        } catch {
+          // Keep raw data
+        }
       }
 
-      if (!res.headersSent) {
+      let message =
+        upstreamData?.error?.message ||
+        upstreamData?.message ||
+        error.message ||
+        'Kimi request failed';
 
-        let message =
-          error.message ||
-          'Kimi request failed';
+      console.error(
+        `[PROXY] Returning status ${status}`
+      );
 
-        let status =
-          error.response?.status ||
-          500;
+      console.error(
+        '[PROXY] NVIDIA response:',
+        JSON.stringify(
+          upstreamData || {},
+          null,
+          2
+        )
+      );
 
-        let upstreamData =
-          error.response?.data;
-
-        if (
-          upstreamData &&
-          typeof upstreamData === 'object' &&
-          upstreamData.error?.message
-        ) {
-
-          message =
-            upstreamData.error.message;
-        }
+      if (
+        !res.headersSent
+      ) {
 
         res.status(status).json({
+
           error: {
+
             message,
+
             type:
               'proxy_error',
+
             code:
-              status
+              status,
+
+            upstream:
+              'nvidia',
+
+            model:
+              KIMI_MODEL
           }
         });
 
@@ -939,11 +1238,11 @@ app.post(
           res,
           `data: ${JSON.stringify({
             error: {
-              message:
-                error.message ||
-                'Proxy error',
+              message,
               type:
-                'proxy_error'
+                'proxy_error',
+              code:
+                status
             }
           })}\n\n`
         );
@@ -967,36 +1266,47 @@ app.post(
   }
 );
 
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 // 404
-// ─────────────────────────────────────────────────────────────
+// ============================================================
 
 app.use(
   (req, res) => {
 
     res.status(404).json({
+
       error: {
+
         message:
           `Endpoint ${req.method} ${req.path} not found`,
+
         type:
           'invalid_request_error',
-        code:
-          404
+
+        code: 404
       }
     });
   }
 );
 
-// ─────────────────────────────────────────────────────────────
-// START
-// ─────────────────────────────────────────────────────────────
+// ============================================================
+// START SERVER
+// ============================================================
 
 app.listen(
   PORT,
   () => {
 
     console.log(
-      `[PROXY] Kimi K2.6 proxy running on port ${PORT}`
+      '================================================'
+    );
+
+    console.log(
+      '[PROXY] Kimi K2.6 proxy is running.'
+    );
+
+    console.log(
+      `[PROXY] Port: ${PORT}`
     );
 
     console.log(
@@ -1004,20 +1314,32 @@ app.listen(
     );
 
     console.log(
-      `[PROXY] Max output tokens: ${MAX_TOKENS_LIMIT}`
+      '[PROXY] Context: 256K'
     );
 
     console.log(
-      `[PROXY] Thinking: ${ENABLE_THINKING_MODE ? 'ON' : 'OFF'}`
+      `[PROXY] Max output: ${MAX_TOKENS_LIMIT}`
+    );
+
+    console.log(
+      `[PROXY] Thinking: ${
+        ENABLE_THINKING_MODE
+          ? 'ON'
+          : 'OFF'
+      }`
+    );
+
+    console.log(
+      '================================================'
     );
 
     validateModels()
       .catch(
-        (err) => {
+        error => {
 
           console.error(
-            '[VALIDATION] Startup check failed:',
-            err.message
+            '[VALIDATION] Startup error:',
+            error.message
           );
         }
       );
