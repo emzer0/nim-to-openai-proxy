@@ -105,19 +105,31 @@ app.get("/health", (req, res) => {
 // MODELS
 // ============================================================
 
-app.get("/v1/models", async (req, res) => {
-  try {
-    const response = await fetch(
-      `${PUTER_BASE_URL}/models`,
+app.get("/v1/models", (req, res) => {
+  res.json({
+    object: "list",
+    data: [
       {
-        method: "GET",
-        headers: {
-          Authorization:
-            `Bearer ${PUTER_AUTH_TOKEN}`,
-          Accept: "application/json"
-        }
+        id: "z-ai/glm-5.2",
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: "puter"
+      },
+      {
+        id: "moonshotai/kimi-k2.6",
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: "puter"
+      },
+      {
+        id: "openai/gpt-5.5",
+        object: "model",
+        created: Math.floor(Date.now() / 1000),
+        owned_by: "puter"
       }
-    );
+    ]
+  });
+});
 
     const text =
       await response.text();
